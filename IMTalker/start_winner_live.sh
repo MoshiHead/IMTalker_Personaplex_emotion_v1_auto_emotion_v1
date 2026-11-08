@@ -173,7 +173,7 @@ exec python -u "$SERVER_FILE" \
   --wav2vec_sec 0.96 \
   --fm_chunk_frames 24 \
   --prebuffer_chunks 1 \
-  --render_sub_batch "${RENDER_SUB_BATCH:-24}" \
+  --render_sub_batch "${RENDER_SUB_BATCH:-8}" \
   --renderer_precision fp32 \
   --frame_q_backpressure "${FRAME_Q_BACKPRESSURE:-160}" \
   --jitter_buffer_sec "${JITTER_BUFFER_SEC:-1.0}" \
