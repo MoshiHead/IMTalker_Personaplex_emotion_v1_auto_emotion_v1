@@ -497,11 +497,13 @@ class AutoEmotionManager:
         return int(self._emotion_id)
 
     def reset_session(self) -> None:
-        """Fresh VAD state per browser session; the last detected emotion
-        carries over (same user), falling back to --emotion_id until the
-        first detection of the session."""
+        """Fresh VAD state per browser session. The published emotion resets
+        to the configured --emotion_id (e.g. happy) so every fresh connection
+        starts with the intended default expression; the SER re-detects and
+        takes over from the user's first utterance."""
         with self._lock:
             self.vad.reset()
+            self._emotion_id = self.initial_emotion_id
         while True:
             try:
                 self._queue.get_nowait()
