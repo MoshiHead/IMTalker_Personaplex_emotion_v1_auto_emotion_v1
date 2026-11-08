@@ -18,9 +18,15 @@ class MoshiProcessor extends AudioWorkletProcessor {
     this.initialPartialBufferSamples = asSamples(20);
     this.partialBufferIncrement = asSamples(10);
     this.maxPartialWithIncrements = asSamples(160);
-    this.hardMaxBufferSamples = asSamples(1500);
+    this.hardMaxBufferSamples = asSamples(1200);
     this.emergencyTargetSamples = asSamples(500);
-    this.disableEmergencyDrop = true;
+    // AV_SMOOTH_PATCH_V1: bounded emergency drop. With the server pacing audio
+    // at exactly real time (1.0/fps) the queue can no longer ratchet upward, so
+    // normal operation sits far below this 1200ms cap and nothing is ever dropped.
+    // The drop only fires on a true overflow (a long stall flooding the queue),
+    // where skipping the oldest audio -- and letting the video, paced by
+    // audioStreamTime, jump with it -- keeps A/V in sync instead of drifting.
+    this.disableEmergencyDrop = false;
 
     // State and metrics
     this.initState();

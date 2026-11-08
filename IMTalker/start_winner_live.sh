@@ -78,6 +78,16 @@ else
   )
 fi
 
+# --dump_motion records a rolling window of motion/audio for offline debugging.
+# It costs per-chunk GPU->CPU clones + PCIe transfers on the hot GPU thread plus
+# a ~1.4GB RAM window, so it is OFF by default; set DUMP_MOTION=1 to enable it.
+DUMP_MOTION="${DUMP_MOTION:-0}"
+if [[ "$DUMP_MOTION" == "1" ]]; then
+  DUMP_MOTION_ARGS=(--dump_motion)
+else
+  DUMP_MOTION_ARGS=()
+fi
+
 # STT + query routing + web search have been removed from this pipeline.
 # The server always launches as the plain conversational avatar: every turn
 # is answered from the model's own knowledge.
@@ -163,7 +173,7 @@ exec python -u "$SERVER_FILE" \
   --wav2vec_sec 0.96 \
   --fm_chunk_frames 24 \
   --prebuffer_chunks 1 \
-  --render_sub_batch 8 \
+  --render_sub_batch "${RENDER_SUB_BATCH:-24}" \
   --renderer_precision fp32 \
   --frame_q_backpressure "${FRAME_Q_BACKPRESSURE:-160}" \
   --jitter_buffer_sec "${JITTER_BUFFER_SEC:-1.0}" \
@@ -178,7 +188,7 @@ exec python -u "$SERVER_FILE" \
   --shared_noise \
   --fp32 \
   --tf32 \
-  --dump_motion \
+  "${DUMP_MOTION_ARGS[@]}" \
   --dump_dir "$DUMP_DIR" \
   --silence_helium_path "$SILENCE_HELIUM_PATH" \
   --jpeg_quality 58 \

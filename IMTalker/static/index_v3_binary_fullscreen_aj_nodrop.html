@@ -687,6 +687,19 @@
       if (!frameStore.has(frameIdx)) {
         const bitmap = await decodeFrameFromJpegBytes(jpegU8);
         frameStore.set(frameIdx, { bitmap, chunkId, turnId, speaking });
+        // AV_SMOOTH_PATCH_V1: bound the store even when the render loop stalls.
+        // During an audio rebuffer audioStreamTime freezes, targetFrame stops
+        // advancing, and the render-side purge (which only runs when a frame is
+        // actually drawn) never fires, so ImageBitmaps (~1MB each) would
+        // accumulate without bound. Drop frames already behind the render cursor
+        // and hard-cap the store on every arrival.
+        for (const oldIdx of Array.from(frameStore.keys())) {
+          if (oldIdx < lastRenderedFrame - 1) frameStore.delete(oldIdx);
+        }
+        if (frameStore.size > 150) {
+          const keysAsc = Array.from(frameStore.keys()).sort((a, b) => a - b);
+          for (let i = 0; i < keysAsc.length - 150; i++) frameStore.delete(keysAsc[i]);
+        }
       }
       sServerFps.textContent = String(targetFps);
       sChunks.textContent = String(chunksDone);

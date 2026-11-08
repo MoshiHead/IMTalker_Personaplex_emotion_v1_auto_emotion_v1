@@ -1726,7 +1726,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 # the user starts speaking again (see _answer_end_perf).
                 self._last_text_emit_perf = time.perf_counter()
                 self._turn_text_token_count += 1
-            reply_codes = tokens[:, 1:].detach().to(device="cpu", dtype=torch.int16)
+            # Keep reply_codes on the GPU (a cheap view+detach, no sync). The
+            # CPU int16 copy is only needed by the --dump_motion recording path,
+            # which now does the transfer itself -- this removes a per-step
+            # GPU->CPU sync (12.5x/sec) from the hot path when not dumping.
+            reply_codes = tokens[:, 1:].detach()
             t_decode0 = time.perf_counter()
             reply = self.mimi.decode(tokens[:, 1:])
             reply_pcm = reply[0, 0].detach().float().cpu().numpy()
@@ -3834,6 +3838,72 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     except Exception as e:
                         print(f"[GPU] WARNING audio_q.put failed: {e!r}", flush=True)
 
+                # EMOTION_LIVE_PATCH_V4: batched queue enqueue.
+                def _enqueue_frame_batch(packets: list) -> None:
+                    """Enqueue a whole chunk of frames in ONE event-loop round-trip.
+
+                    The per-packet first-per-turn marks are preserved, but the 24
+                    individual run_coroutine_threadsafe calls (each a cross-thread
+                    round-trip that blocks the GPU producer thread) collapse into a
+                    single one. Backpressure semantics are unchanged: the batched
+                    coroutine still awaits each frame_q.put, so a full queue blocks
+                    the producer exactly as before.
+                    """
+                    if not packets:
+                        return
+                    for pkt in packets:
+                        reply_engine._mark_first_per_turn(
+                            "server_avatar_frame_ready", pkt.get("turn_id"), at=pkt.get("t_ready"),
+                        )
+
+                    async def _put_all() -> None:
+                        for pkt in packets:
+                            await frame_q.put(pkt)
+
+                    fut = asyncio.run_coroutine_threadsafe(_put_all(), event_loop)
+                    try:
+                        fut.result(timeout=FRAME_Q_PUT_TIMEOUT_S)
+                    except TimeoutError:
+                        print(
+                            f"[GPU] WARNING frame_q batch put timeout ({len(packets)} frames)",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[GPU] WARNING frame_q batch put failed: {e!r}", flush=True)
+
+                def _enqueue_audio_batch(packets: list) -> None:
+                    """Audio twin of _enqueue_frame_batch (one round-trip per chunk)."""
+                    if not packets:
+                        return
+                    for pkt in packets:
+                        _pkt_turn = pkt.get("turn_id")
+                        reply_engine._mark_first_per_turn(
+                            "server_audio_queue_enter", _pkt_turn,
+                            note=f"audio_q depth at enqueue={audio_q.qsize()}",
+                        )
+                        if _pkt_turn is not None:
+                            reply_engine.conv_logger.latency.queue_state(
+                                _pkt_turn, at_mark="server_audio_queue_enter",
+                                audio_queue_depth=audio_q.qsize(),
+                                pending_audio_duration_s=round(audio_q.qsize() / float(args.fps), 3),
+                                input_backlog_s=round(reply_engine.input_backlog_sec(), 3),
+                            )
+
+                    async def _put_all() -> None:
+                        for pkt in packets:
+                            await audio_q.put(pkt)
+
+                    fut = asyncio.run_coroutine_threadsafe(_put_all(), event_loop)
+                    try:
+                        fut.result(timeout=FRAME_Q_PUT_TIMEOUT_S)
+                    except TimeoutError:
+                        print(
+                            f"[GPU] WARNING audio_q batch put timeout ({len(packets)} packets)",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[GPU] WARNING audio_q batch put failed: {e!r}", flush=True)
+
                 if prebuffer_chunks <= 0 and not prebuffer_ready.is_set():
                     prebuffer_ready.set()
                     print("[GPU] prebuffer=0, sender starts immediately", flush=True)
@@ -4045,13 +4115,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             fm_info["assistant_active"] = bool(assistant_active)
                             fm_info["assistant_reply_rms"] = float(reply_rms)
                             fm_info["assistant_step_rms"] = float(step_rms)
-                            used_codes = [
-                                s["reply_codes"].to(dtype=torch.int16).contiguous()
-                                for s in used_steps
-                                if isinstance(s.get("reply_codes"), torch.Tensor)
-                            ]
-                            if used_codes and fm_engine.dump_motion:
-                                fm_engine._session_live_token_parts.extend(used_codes)
+                            if fm_engine.dump_motion:
+                                used_codes = [
+                                    s["reply_codes"].detach().to(device="cpu", dtype=torch.int16).contiguous()
+                                    for s in used_steps
+                                    if isinstance(s.get("reply_codes"), torch.Tensor)
+                                ]
+                                if used_codes:
+                                    fm_engine._session_live_token_parts.extend(used_codes)
                             fm_engine._record_session_chunk(pcm_chunk, motion, fm_info)
                         else:
                             result = fm_engine.feed_pcm_f32(reply_pcm)
@@ -4062,13 +4133,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             steps_per_avatar_chunk = max(1, int(round(len(pcm_chunk) / MIMI_FRAME_SIZE)))
                             used_steps = pending_reply_steps[:steps_per_avatar_chunk]
                             pending_reply_steps = pending_reply_steps[steps_per_avatar_chunk:]
-                            used_codes = [
-                                s["reply_codes"].to(dtype=torch.int16).contiguous()
-                                for s in used_steps
-                                if isinstance(s.get("reply_codes"), torch.Tensor)
-                            ]
-                            if used_codes and fm_engine.dump_motion:
-                                fm_engine._session_live_token_parts.extend(used_codes)
+                            if fm_engine.dump_motion:
+                                used_codes = [
+                                    s["reply_codes"].detach().to(device="cpu", dtype=torch.int16).contiguous()
+                                    for s in used_steps
+                                    if isinstance(s.get("reply_codes"), torch.Tensor)
+                                ]
+                                if used_codes:
+                                    fm_engine._session_live_token_parts.extend(used_codes)
 
                         reply_avatar_chunk_idx += 1
                         chunk_produce_count += 1
@@ -4101,15 +4173,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             moshi_total_ms + float(fm_info["helium_ms"]) + float(fm_info["fm_ms"])
                         )
 
-                        for frame_offset, audio_slice in enumerate(frame_audio[:n_frames]):
-                            _enqueue_audio({
+                        _audio_batch = [
+                            {
                                 "frame_number": emitted + frame_offset,
-                                "audio_pcm": np.asarray(
-                                    audio_slice,
-                                    dtype=np.float32,
-                                ).copy(),
+                                "audio_pcm": np.asarray(audio_slice, dtype=np.float32).copy(),
                                 "turn_id": _lat_turn_now,
-                            })
+                            }
+                            for frame_offset, audio_slice in enumerate(frame_audio[:n_frames])
+                        ]
+                        _enqueue_audio_batch(_audio_batch)
 
                         t_chunk_start = time.perf_counter()
 
@@ -4131,7 +4203,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
                             for pkt in packets:
                                 pkt["turn_id"] = _lat_turn_now
-                                _enqueue_frame(pkt)
+                            _enqueue_frame_batch(packets)
 
                         chunk_wall_ms = _ms(t_chunk_start)
                         produce_latency_ms = _ms(t_recv)
@@ -4169,6 +4241,22 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             f"frame_q={q_depth} "
                             f"abs={emitted}"
                         )
+
+                        # Real-time budget watchdog: one chunk must be produced in
+                        # <= n_frames/fps seconds or the producer falls behind
+                        # permanently (it is pinned to real time by sender pacing).
+                        # Surface an explicit per-chunk warning with the cost
+                        # breakdown the moment the budget is exceeded, so the
+                        # bottleneck stage is identifiable directly from the log.
+                        _chunk_budget_ms = 1000.0 * float(n_frames) / float(args.fps)
+                        if produce_latency_ms > _chunk_budget_ms:
+                            hot_log.log(
+                                f"[GPU] OVER-BUDGET chunk#{reply_avatar_chunk_idx}: "
+                                f"cost {produce_latency_ms:.0f}ms > budget {_chunk_budget_ms:.0f}ms "
+                                f"(moshi={moshi_total_ms:.0f} helium={float(fm_info['helium_ms']):.0f} "
+                                f"fm={float(fm_info['fm_ms']):.0f} render+jpeg={chunk_wall_ms:.0f}). "
+                                f"Producer cannot keep real time; mic backlog will grow."
+                            )
 
                         if reply_avatar_chunk_idx % 50 == 0:
                             # Microphone backlog is the single best predictor of
@@ -4335,7 +4423,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 # Even if target_t is already late, keep websocket audio writes
                 # spaced near the media frame cadence instead of flushing a
                 # backlog back-to-back into the browser decoder/worklet.
-                min_send_interval_s = max(0.001, 0.92 / float(args.fps))
+                min_send_interval_s = max(0.001, 1.0 / float(args.fps))
                 next_send_wall = send_start_wall
 
                 while True:
