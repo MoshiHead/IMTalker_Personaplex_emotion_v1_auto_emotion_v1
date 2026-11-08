@@ -31,21 +31,24 @@ EMOTION_NAMES = {0: "neutral", 1: "happy", 2: "sad", 3: "angry", 4: "surprise", 
 TARGET_SR = 24_000  # server mic PCM rate (Mimi sample rate)
 SER_SR = 16_000     # wav2vec2 SER models expect 16 kHz
 
-DEFAULT_SER_MODEL = "audeering/wav2vec2-large-robust-finetuned-emotion"
+DEFAULT_SER_MODEL = "superb/wav2vec2-base-superb-er"
 
 # Fallback label order for the default SER model (used only when the model
-# config carries no id2label). audeering/wav2vec2-large-robust-finetuned-emotion:
-# 7 classes trained on MSP-Podcast (real conversational speech).
-DEFAULT_SER_LABELS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+# config carries no id2label). superb/wav2vec2-base-superb-er: 4 classes
+# trained on IEMOCAP (English conversational speech), ~95M params.
+DEFAULT_SER_LABELS = ["neu", "hap", "ang", "sad"]
 
 # SER label name -> avatar emotion id (generator/FM.py EMOTION_MAP).
+# Covers both the IEMOCAP abbreviations (neu/hap/ang/sad) and the full-word
+# labels used by e.g. ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
+# (angry, calm, disgust, fearful, happy, neutral, sad, surprised).
 # "disgust" is handled separately via the --ser_disgust_map arg because the
 # emotion LoRA was not trained on disgust.
 SER_LABEL_TO_EMOTION_ID = {
-    "neutral": 0, "neutrality": 0, "calm": 0,
-    "happy": 1, "happiness": 1, "joy": 1, "excited": 1,
+    "neutral": 0, "neutrality": 0, "calm": 0, "neu": 0,
+    "happy": 1, "happiness": 1, "joy": 1, "excited": 1, "hap": 1, "exc": 1,
     "sad": 2, "sadness": 2,
-    "angry": 3, "anger": 3, "frustrated": 3,
+    "angry": 3, "anger": 3, "frustrated": 3, "ang": 3,
     "surprise": 4, "surprised": 4,
     "fear": 5, "fearful": 5, "fearfulness": 5,
 }
@@ -159,11 +162,11 @@ class SpeechEmotionClassifier:
 
     Supports two checkpoint layouts:
       * standard Wav2Vec2ForSequenceClassification repos (architectures field
-        names a *ForSequenceClassification / *ForAudioClassification class)
-        -> loaded via AutoModelForAudioClassification
-      * audeering-style repos (wav2vec2 backbone + mean-pool + linear `head`,
-        e.g. audeering/wav2vec2-large-robust-finetuned-emotion) -> loaded via
-        the small documented EmotionModel wrapper
+        names a *ForSequenceClassification / *ForAudioClassification class,
+        e.g. superb/wav2vec2-base-superb-er) -> loaded via
+        AutoModelForAudioClassification
+      * audeering-style repos (wav2vec2 backbone + mean-pool + linear `head`)
+        -> loaded via the small documented EmotionModel wrapper
     """
 
     def __init__(self, model_name: str, device: str = "cuda", half: bool = False,
