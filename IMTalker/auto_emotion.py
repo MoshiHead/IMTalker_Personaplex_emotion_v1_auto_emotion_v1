@@ -13,15 +13,24 @@ Design rules (mirrors the server's own defensive patterns):
     stream; a slow or failed inference can never stall the streaming loop.
   * Any failure (model load, inference, feed) degrades to the fixed
     --emotion_id behaviour instead of raising.
+
+Every classified utterance is appended to a CSV log (one file per server
+start, <IMTalker dir>/emotion_logs/emotion_log_YYYYMMDD_HHMMSS.csv, override
+with IMTALKER_EMOTION_LOG_DIR) recording both the detected emotion and the
+emotion actually sent to the avatar model.
 """
 
 from __future__ import annotations
 
 import collections
+import csv
+import os
 import queue
 import threading
 import time
 import traceback
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 
@@ -273,6 +282,72 @@ class SpeechEmotionClassifier:
 
 
 # ---------------------------------------------------------------------------
+# Emotion prediction log (one CSV row per classified utterance)
+# ---------------------------------------------------------------------------
+
+class EmotionLogWriter:
+    """Appends one CSV row per classified user utterance.
+
+    File: <log_dir>/emotion_log_YYYYMMDD_HHMMSS.csv (one per server start).
+    The `session` column increments on every browser connection so individual
+    conversations can be told apart inside the file. Writes are flushed per
+    row (one row per utterance - durability over batching).
+    """
+
+    HEADER = [
+        "timestamp", "session", "utterance", "duration_sec",
+        "detected_label", "detected_emotion", "confidence", "accepted",
+        "previous_emotion", "applied_emotion",
+    ]
+
+    def __init__(self, log_dir: Path) -> None:
+        self._lock = threading.Lock()
+        self.session = 0
+        self._utterance = 0
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+        self.path = log_dir / f"emotion_log_{stamp}.csv"
+        new_file = not self.path.exists() or self.path.stat().st_size == 0
+        self._fh = self.path.open("a", encoding="utf-8", newline="")
+        self._writer = csv.writer(self._fh)
+        if new_file:
+            self._writer.writerow(self.HEADER)
+            self._fh.flush()
+
+    def new_session(self) -> None:
+        with self._lock:
+            self.session += 1
+            self._utterance = 0
+
+    def log(self, duration_sec: float, detected_label: str, detected_emotion: str,
+            confidence: float, accepted: bool, previous_emotion: str,
+            applied_emotion: str) -> None:
+        row = [
+            datetime.now().isoformat(timespec="milliseconds"),
+            self.session,
+            self._utterance + 1,
+            f"{duration_sec:.2f}",
+            detected_label,
+            detected_emotion,
+            f"{confidence:.3f}",
+            "yes" if accepted else "no",
+            previous_emotion,
+            applied_emotion,
+        ]
+        with self._lock:
+            self._utterance += 1
+            self._writer.writerow(row)
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Manager: VAD on the GPU thread, SER on a daemon worker thread
 # ---------------------------------------------------------------------------
 
@@ -301,6 +376,7 @@ class AutoEmotionManager:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._classifier: SpeechEmotionClassifier | None = None
+        self._logger: EmotionLogWriter | None = None
         self.utterances_classified = 0
         self.utterances_dropped = 0
         self.feed_errors = 0
@@ -316,6 +392,7 @@ class AutoEmotionManager:
         self._classifier = SpeechEmotionClassifier(
             model_name, device=device, half=half, disgust_map=disgust_map
         )
+        self._logger = self._make_logger()
         self._worker = threading.Thread(
             target=self._worker_loop, name="auto-emotion-ser", daemon=True
         )
@@ -327,6 +404,20 @@ class AutoEmotionManager:
             f"(SER model loaded in {time.perf_counter() - t0:.1f}s)",
             flush=True,
         )
+        if self._logger is not None:
+            print(f"[AUTO-EMOTION] logging predictions to {self._logger.path}", flush=True)
+
+    @staticmethod
+    def _make_logger() -> EmotionLogWriter | None:
+        """Create the CSV prediction log. IMTALKER_EMOTION_LOG_DIR overrides the
+        default <IMTalker dir>/emotion_logs. Any failure just disables logging."""
+        try:
+            log_dir = os.environ.get("IMTALKER_EMOTION_LOG_DIR", "").strip()
+            base = Path(log_dir) if log_dir else Path(__file__).resolve().parent / "emotion_logs"
+            return EmotionLogWriter(base)
+        except Exception as exc:
+            print(f"[AUTO-EMOTION] emotion log disabled: {exc!r}", flush=True)
+            return None
 
     def feed(self, pcm_i16: np.ndarray, input_sr: int) -> None:
         """GPU-producer-thread entry point. Never raises, never blocks."""
@@ -376,7 +467,8 @@ class AutoEmotionManager:
                 continue
             self.utterances_classified += 1
             prev = self._emotion_id
-            if conf >= self.confidence_threshold:
+            accepted = conf >= self.confidence_threshold
+            if accepted:
                 self._emotion_id = int(emotion_id)
                 action = "switching" if prev != emotion_id else "confirmed"
             else:
@@ -387,6 +479,19 @@ class AutoEmotionManager:
                 f"{EMOTION_NAMES.get(self._emotion_id, self._emotion_id)}] {action}",
                 flush=True,
             )
+            if self._logger is not None:
+                try:
+                    self._logger.log(
+                        duration_sec=dur,
+                        detected_label=label,
+                        detected_emotion=EMOTION_NAMES.get(emotion_id, str(emotion_id)),
+                        confidence=conf,
+                        accepted=accepted,
+                        previous_emotion=EMOTION_NAMES.get(prev, str(prev)),
+                        applied_emotion=EMOTION_NAMES.get(self._emotion_id, str(self._emotion_id)),
+                    )
+                except Exception as exc:
+                    print(f"[AUTO-EMOTION] emotion log write failed: {exc!r}", flush=True)
 
     def current_emotion_id(self, default: int = 0) -> int:
         return int(self._emotion_id)
@@ -402,9 +507,13 @@ class AutoEmotionManager:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+        if self._logger is not None:
+            self._logger.new_session()
 
     def stop(self) -> None:
         self._stop.set()
+        if self._logger is not None:
+            self._logger.close()
 
 
 # ---------------------------------------------------------------------------

@@ -140,6 +140,77 @@ check("reset_session clears VAD state", mgr.vad._in_speech is False)
 mgr.stop()
 mgr2.stop()
 
+# --- 10. CSV prediction log ----------------------------------------------------
+import csv
+import os
+import tempfile
+
+from auto_emotion import EmotionLogWriter  # noqa: E402
+
+log_dir = Path(tempfile.mkdtemp(prefix="emotion_log_test_"))
+os.environ["IMTALKER_EMOTION_LOG_DIR"] = str(log_dir)
+
+mgr3 = AutoEmotionManager(args)
+mgr3._classifier = MockClassifier()  # confident happy
+mgr3._logger = mgr3._make_logger()
+check("logger created from env var dir", mgr3._logger is not None)
+mgr3._worker = __import__("threading").Thread(target=mgr3._worker_loop, daemon=True)
+mgr3._worker.start()
+
+mgr3.reset_session()  # session 1
+for i in range(0, len(pcm16), chunk):
+    mgr3.feed(pcm16[i:i + chunk], SR)
+deadline = time.time() + 5.0
+while mgr3.current_emotion_id() != 1 and time.time() < deadline:
+    time.sleep(0.05)
+time.sleep(0.3)  # let the log row flush
+mgr3.stop()
+
+log_files = list(log_dir.glob("emotion_log_*.csv"))
+check("one CSV log file created", len(log_files) == 1, f"{len(log_files)}")
+if log_files:
+    rows = list(csv.reader(log_files[0].open(encoding="utf-8")))
+    check("CSV has header + 1 utterance row", len(rows) == 2, f"{len(rows)} rows")
+    if len(rows) == 2:
+        header, row = rows
+        check("header columns", header == EmotionLogWriter.HEADER, ",".join(header))
+        rec = dict(zip(header, row))
+        check("row: session 1", rec["session"] == "1", rec["session"])
+        check("row: utterance 1", rec["utterance"] == "1", rec["utterance"])
+        check("row: detected label", rec["detected_label"] == "happy", rec["detected_label"])
+        check("row: detected emotion", rec["detected_emotion"] == "happy", rec["detected_emotion"])
+        check("row: confidence", rec["confidence"] == "0.900", rec["confidence"])
+        check("row: accepted", rec["accepted"] == "yes", rec["accepted"])
+        check("row: previous emotion", rec["previous_emotion"] == "neutral", rec["previous_emotion"])
+        check("row: applied emotion (sent to model)", rec["applied_emotion"] == "happy",
+              rec["applied_emotion"])
+
+# low-confidence row: detected angry but applied stays neutral
+mgr4 = AutoEmotionManager(args)
+mgr4._classifier = LowConfClassifier()
+mgr4._logger = mgr4._make_logger()
+mgr4._worker = __import__("threading").Thread(target=mgr4._worker_loop, daemon=True)
+mgr4._worker.start()
+mgr4.reset_session()
+for i in range(0, len(pcm16), chunk):
+    mgr4.feed(pcm16[i:i + chunk], SR)
+time.sleep(1.0)
+mgr4.stop()
+log_files2 = sorted(log_dir.glob("emotion_log_*.csv"))
+check("second log file created", len(log_files2) == 2, f"{len(log_files2)}")
+if len(log_files2) == 2:
+    rows = list(csv.reader(log_files2[-1].open(encoding="utf-8")))
+    if len(rows) == 2:
+        rec = dict(zip(rows[0], rows[1]))
+        check("low-conf row: detected angry", rec["detected_emotion"] == "angry", rec["detected_emotion"])
+        check("low-conf row: not accepted", rec["accepted"] == "no", rec["accepted"])
+        check("low-conf row: applied stays neutral", rec["applied_emotion"] == "neutral",
+              rec["applied_emotion"])
+
+os.environ.pop("IMTALKER_EMOTION_LOG_DIR", None)
+import shutil
+shutil.rmtree(log_dir, ignore_errors=True)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURES: {FAILURES}")
