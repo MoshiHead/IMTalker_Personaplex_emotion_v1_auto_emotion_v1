@@ -1,0 +1,2 @@
+# IMTalker_Personaplex_emotion_v1_auto_emotion_v1
+try to apply automatic emotion detection in this repo pipeline IMTalker_Personaplex_emotion_v1
