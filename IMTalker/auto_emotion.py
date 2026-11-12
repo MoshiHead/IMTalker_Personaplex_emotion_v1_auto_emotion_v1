@@ -2,9 +2,10 @@
 
 Taps the user's microphone PCM (already decoded to 24 kHz int16 in the GPU
 producer thread), segments it into utterances with an energy-based VAD, runs a
-wav2vec2 speech-emotion-recognition (SER) model on each completed utterance in
-a background daemon thread, and publishes the detected emotion id for the FM
-generator to pick up on its next 0.96 s chunk.
+speech-emotion-recognition (SER) model (emotion2vec+ via funasr by default;
+wav2vec2 classification heads remain supported) on each completed utterance
+in a background daemon thread, and publishes the detected emotion id for the
+FM generator to pick up on its next 0.96 s chunk.
 
 Design rules (mirrors the server's own defensive patterns):
   * feed() runs on the GPU producer thread and must stay in the microsecond
@@ -38,23 +39,30 @@ import numpy as np
 EMOTION_NAMES = {0: "neutral", 1: "happy", 2: "sad", 3: "angry", 4: "surprise", 5: "fear"}
 
 TARGET_SR = 24_000  # server mic PCM rate (Mimi sample rate)
-SER_SR = 16_000     # wav2vec2 SER models expect 16 kHz
+SER_SR = 16_000     # SER models expect 16 kHz (emotion2vec and wav2vec2 alike)
 
-DEFAULT_SER_MODEL = "superb/wav2vec2-base-superb-er"
+DEFAULT_SER_MODEL = "emotion2vec/emotion2vec_plus_base"
 
-# Fallback label order for the default SER model (used only when the model
+# Fallback label order for wav2vec2-style repos (used only when the model
 # config carries no id2label). superb/wav2vec2-base-superb-er: 4 classes
 # trained on IEMOCAP (English conversational speech), ~95M params.
+# emotion2vec+ models do not use this fallback: their labels come from the
+# checkpoint's tokens.txt via funasr (see SpeechEmotionClassifier).
 DEFAULT_SER_LABELS = ["neu", "hap", "ang", "sad"]
 
 # SER label name -> avatar emotion id (generator/FM.py EMOTION_MAP).
-# Covers both the IEMOCAP abbreviations (neu/hap/ang/sad) and the full-word
-# labels used by e.g. ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
-# (angry, calm, disgust, fearful, happy, neutral, sad, surprised).
+# Covers the IEMOCAP abbreviations (neu/hap/ang/sad), the full-word labels
+# used by e.g. ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
+# (angry, calm, disgust, fearful, happy, neutral, sad, surprised) and the
+# emotion2vec+ classes (angry, disgusted, fearful, happy, neutral, other,
+# sad, surprised -- emotion2vec tokens are bilingual, e.g. "生气/angry",
+# and are normalised to their English part before this lookup). "other"/
+# "unknown"/"<unk>" have no avatar counterpart and fall back to neutral.
 # "disgust" is handled separately via the --ser_disgust_map arg because the
 # emotion LoRA was not trained on disgust.
 SER_LABEL_TO_EMOTION_ID = {
-    "neutral": 0, "neutrality": 0, "calm": 0, "neu": 0,
+    "neutral": 0, "neutrality": 0, "calm": 0, "neu": 0, "other": 0,
+    "unknown": 0, "<unk>": 0,
     "happy": 1, "happiness": 1, "joy": 1, "excited": 1, "hap": 1, "exc": 1,
     "sad": 2, "sadness": 2,
     "angry": 3, "anger": 3, "frustrated": 3, "ang": 3,
@@ -167,9 +175,12 @@ class EnergyVAD:
 # ---------------------------------------------------------------------------
 
 class SpeechEmotionClassifier:
-    """wav2vec2-based speech emotion classifier (16 kHz mono input).
+    """Speech emotion classifier (16 kHz mono input).
 
-    Supports two checkpoint layouts:
+    Supports three checkpoint families:
+      * emotion2vec+ repos (the default, e.g. emotion2vec/emotion2vec_plus_base:
+        9 classes, ~90M params) -> loaded via funasr.AutoModel with hub="hf"
+        (requires the funasr package)
       * standard Wav2Vec2ForSequenceClassification repos (architectures field
         names a *ForSequenceClassification / *ForAudioClassification class,
         e.g. superb/wav2vec2-base-superb-er) -> loaded via
@@ -181,13 +192,21 @@ class SpeechEmotionClassifier:
     def __init__(self, model_name: str, device: str = "cuda", half: bool = False,
                  disgust_map: int = 0) -> None:
         import torch
-        from transformers import AutoConfig, AutoFeatureExtractor
 
         self.torch = torch
         self.device = torch.device(device)
         self.half = bool(half) and self.device.type == "cuda"
         self.disgust_map = int(disgust_map)
         self.model_name = str(model_name)
+        self.feature_extractor = None
+        self.id2label: dict = {}
+        self._warned_labels: set = set()
+
+        if self._is_emotion2vec():
+            self._load_emotion2vec()
+            return
+
+        from transformers import AutoConfig, AutoFeatureExtractor
 
         config = AutoConfig.from_pretrained(self.model_name)
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(self.model_name)
@@ -207,7 +226,29 @@ class SpeechEmotionClassifier:
         self.id2label = {int(k): str(v).lower() for k, v in id2label.items()}
         if not self.id2label:
             self.id2label = {i: n for i, n in enumerate(DEFAULT_SER_LABELS)}
-        self._warned_labels: set = set()
+
+    def _is_emotion2vec(self) -> bool:
+        return "emotion2vec" in self.model_name.lower()
+
+    def _load_emotion2vec(self) -> None:
+        from funasr import AutoModel
+
+        # hub="hf" resolves the checkpoint from the Hugging Face hub (the
+        # emotion2vec/* repos), i.e. the same HF cache the deployment
+        # notebook pre-downloads into. disable_update skips funasr's PyPI
+        # version check so server startup never stalls on the network.
+        # fp16 is not applied to the funasr stack (--ser_half is accepted
+        # but ignored for this backend).
+        self.model = AutoModel(
+            model=self.model_name,
+            hub="hf",
+            device=str(self.device),
+            disable_update=True,
+        )
+        self.half = False
+        # Labels are returned per prediction by funasr (from the checkpoint's
+        # tokens.txt); there is no static id2label on the funasr side.
+        self.id2label = {}
 
     def _load_standard(self) -> None:
         from transformers import AutoModelForAudioClassification
@@ -249,6 +290,9 @@ class SpeechEmotionClassifier:
 
     def _label_to_emotion_id(self, label: str) -> int:
         key = str(label).strip().lower()
+        if "/" in key:
+            # emotion2vec+ tokens are bilingual, e.g. "生气/angry" -> "angry"
+            key = key.split("/")[-1].strip()
         if key in ("disgust", "disgusted"):
             return self.disgust_map
         if key in SER_LABEL_TO_EMOTION_ID:
@@ -266,8 +310,13 @@ class SpeechEmotionClassifier:
         wav = torch.from_numpy(np.asarray(pcm_24k, dtype=np.float32).reshape(1, -1))
         if TARGET_SR != SER_SR:
             wav = torchaudio.functional.resample(wav, TARGET_SR, SER_SR)
+        pcm_16k = wav[0].numpy()
+
+        if self._is_emotion2vec():
+            return self._predict_emotion2vec(pcm_16k)
+
         inputs = self.feature_extractor(
-            wav[0].numpy(), sampling_rate=SER_SR, return_tensors="pt"
+            pcm_16k, sampling_rate=SER_SR, return_tensors="pt"
         )
         input_values = inputs["input_values"].to(self.device)
         if self.half:
@@ -278,6 +327,53 @@ class SpeechEmotionClassifier:
         conf, idx = torch.max(probs, dim=0)
         label = self.id2label.get(int(idx), str(int(idx)))
         return self._label_to_emotion_id(label), label, float(conf)
+
+    def _predict_emotion2vec(self, pcm_16k: np.ndarray):
+        """emotion2vec+ path: funasr AutoModel.generate on one utterance.
+
+        Returns the same (emotion_id, label, confidence) triple as the
+        wav2vec2 path. funasr's generate accepts a 16 kHz float32 numpy
+        array directly; a temp-wav fallback keeps older builds working.
+        """
+        pcm_16k = np.asarray(pcm_16k, dtype=np.float32)
+        try:
+            results = self.model.generate(
+                pcm_16k,
+                fs=SER_SR,
+                granularity="utterance",
+                extract_embedding=False,
+            )
+        except Exception:
+            # Some funasr builds only accept file inputs: fall back to a
+            # temp wav (utterances are <= 12 s, so the write is trivial).
+            import tempfile
+
+            import soundfile as sf
+
+            fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            try:
+                sf.write(tmp_path, pcm_16k, SER_SR)
+                results = self.model.generate(
+                    tmp_path,
+                    granularity="utterance",
+                    extract_embedding=False,
+                )
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        if not results:
+            return 0, "neutral", 0.0
+        r = results[0]
+        labels = [str(x) for x in (r.get("labels") or [])]
+        scores = [float(x) for x in (r.get("scores") or [])]
+        if not labels or not scores or len(labels) != len(scores):
+            return 0, "neutral", 0.0
+        idx = int(np.argmax(scores))
+        label = labels[idx]
+        return self._label_to_emotion_id(label), label, float(scores[idx])
 
 
 
