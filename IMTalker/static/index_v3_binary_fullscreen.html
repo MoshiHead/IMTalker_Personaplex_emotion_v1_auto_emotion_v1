@@ -335,18 +335,26 @@
       const h = videoCanvas.height;
       videoCtx.clearRect(0, 0, w, h);
       videoCtx.save();
-      // Rotate streamed frames 90 degrees clockwise, then fit the full face in frame.
-      videoCtx.translate(0, h);
-      videoCtx.rotate(-Math.PI / 2);
-      const rotatedW = h;
-      const rotatedH = w;
-      const scale = Math.min(rotatedW / bitmap.width, rotatedH / bitmap.height);
+      // // Rotate streamed frames 90 degrees clockwise, then fit the full face in frame.
+      // videoCtx.translate(0, h);
+      // videoCtx.rotate(-Math.PI / 2);
+      // const rotatedW = h;
+      // const rotatedH = w;
+      // const scale = Math.min(rotatedW / bitmap.width, rotatedH / bitmap.height);
+      // const dw = bitmap.width * scale;
+      // const dh = bitmap.height * scale;
+      // const dx = (rotatedW - dw) * 0.5;
+      // const dy = (rotatedH - dh) * 0.5;
+      // videoCtx.drawImage(bitmap, dx, dy, dw, dh);
+      // videoCtx.restore();
+      // No rotation: draw the streamed frame as-is, scaled and centered to fit.
+      const scale = Math.min(w / bitmap.width, h / bitmap.height);
       const dw = bitmap.width * scale;
       const dh = bitmap.height * scale;
-      const dx = (rotatedW - dw) * 0.5;
-      const dy = (rotatedH - dh) * 0.5;
+      const dx = (w - dw) * 0.5;
+      const dy = (h - dh) * 0.5;
       videoCtx.drawImage(bitmap, dx, dy, dw, dh);
-      videoCtx.restore();
+
     }
     window.addEventListener("resize", resizeCanvasToViewport);
 
