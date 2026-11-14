@@ -575,8 +575,8 @@
       videoCtx.clearRect(0, 0, w, h);
       videoCtx.save();
       // Rotate streamed frames 90 degrees clockwise, then fit the full face in frame.
-      videoCtx.translate(w, 0);
-      videoCtx.rotate(Math.PI / 2);
+      videoCtx.translate(0, h);
+      videoCtx.rotate(-Math.PI / 2);
       const rotatedW = h;
       const rotatedH = w;
       const scale = Math.min(rotatedW / bitmap.width, rotatedH / bitmap.height);
